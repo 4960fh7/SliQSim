@@ -108,6 +108,10 @@ private:
     bool isReorder;
     bool isAlloc;
     int nClbits;
+    double p0_mid = 0.0;
+    double p1_mid = 0.0;
+    void execute_mid_circuit_measure(int qIndex, int forced_val);
+    void sim_qasm_pass(std::string qasm, int forced_val, int mid_measure_qubit);
     std::vector<std::vector<int>> measured_qubits_to_clbits; // empty if not measured
     std::string measure_outcome;
     double normalize_factor; // normalization factor used in measurement

@@ -125,7 +125,7 @@ void Simulator::measure_one(int position, int kd2, double H_factor, int nVar, in
     int comple;
     int noNode_f = 0; //flag: 1 if the node we want to measure is reduced
     std::uniform_real_distribution<double> dis(0.0, 1.0);
-	  double p0, p1, p;
+    double p0, p1, p;
     double rand_num;
     double epsilon = 0.001;
     DdNode *node, *tmp;
@@ -156,6 +156,7 @@ void Simulator::measure_one(int position, int kd2, double H_factor, int nVar, in
     {
         p0 = 0.5;
         p1 = 0.5;
+        p = 1.0;
     }
     else
     {
@@ -167,30 +168,35 @@ void Simulator::measure_one(int position, int kd2, double H_factor, int nVar, in
         p1 *= H_factor * H_factor * normalize_factor * normalize_factor;
         Cudd_RecursiveDeref(manager, node);
         p = p0 + p1;
-        if (abs(p - 1) > epsilon)
-		    {
-            std::cerr << "[error]Numerical error: p0 + p1 = " << p << ", not 1" << std::endl;
-    			  std::exit(1);
-    		}
+        
+        if (p < 1e-10)
+        {
+            std::cerr << "[error] Numerical error: State probability trace is 0." << std::endl;
+            std::exit(1);
+        }
     }
-	
-    double error_tmp = abs(p0 + p1 - 1);
+    
+    double error_tmp = abs(p - 1);
     if (error_tmp > error)
-	    error = error_tmp;
+        error = error_tmp;
 
-    /* sample */
+    double sampling_threshold = p0 / p;
+
     rand_num = dis(gen);
-    if (rand_num > p0)
+    if (rand_num > sampling_threshold)
     {
-        (*outcome)[n - 1 - index] = '1'; // LSB: q0
-        // (*outcome)[index] = '1'; // LSB: qn-1
-        normalize_factor /= sqrt(p1);
+        (*outcome)[n - 1 - index] = '1';
+        
+        double norm_p1 = (p1 > 1e-10) ? p1 : 1e-10;
+        
+        normalize_factor /= sqrt(norm_p1 / p);
     }
     else
     {
-        // (*outcome)[n - 1 - index] = '0'; // LSB: q0
-        // (*outcome)[index] = '0'; // LSB: qn-1
-        normalize_factor /= sqrt(p0);
+        (*outcome)[n - 1 - index] = '0';
+        
+        double norm_p0 = (p0 > 1e-10) ? p0 : 1e-10;
+        normalize_factor /= sqrt(norm_p0 / p);
     }
 }
 
@@ -333,17 +339,15 @@ void Simulator::measurement()
     std::unordered_map<std::string, int>::iterator it;
     std::string measure_outcome_qubits;
     std::string measure_outcome_clbits;
+
+    double base_normalize_factor = normalize_factor; 
+
     for (int i = 0; i < shots; i++)
     {
-        for (int j = 0; j < n; j++)
-        {
-            measure_outcome_qubits += '0';
-        }
-        for (int j = 0; j < nClbits; j++) 
-        {
-            measure_outcome_clbits += '0';
-        }
-        normalize_factor = 1;
+        for (int j = 0; j < n; j++) measure_outcome_qubits += '0';
+        for (int j = 0; j < nClbits; j++) measure_outcome_clbits += '0';
+        
+        normalize_factor = base_normalize_factor; 
 
         for (int j = 0; j < indCount1; j++)  // measure for the (top) j^th level variable
         {
@@ -1390,4 +1394,70 @@ void Simulator::getStatevector()
     statevector += "]";
 
     delete[] assign;
+}
+
+/**Function*************************************************************
+  Synopsis    [Deterministically collapse BDD for mid-circuit measure]
+***********************************************************************/
+void Simulator::execute_mid_circuit_measure(int qIndex, int forced_val)
+{
+    p0_mid = 0.0;
+    p1_mid = 0.0;
+
+    create_bigBDD(); 
+
+    double oneroot2 = 1 / sqrt(2);
+    double H_factor = pow(oneroot2, k%2);
+    int nAnci_oneInt = ceil(log(r) / log(2)), nAnci_fourInt = ceil(log(w) / log(2)), nAnci = nAnci_oneInt + nAnci_fourInt, nVar = n + nAnci;
+
+    int index = Cudd_ReadInvPerm(manager, qIndex);
+    int comple = Cudd_IsComplement(bigBDD);
+    DdNode* tmp = Cudd_Regular(bigBDD);
+
+    while (!(tmp->index == index)) {
+        if (cuddIsConstant(tmp)) break;
+        if ((tmp->index < n)) tmp = cuddT(tmp);
+        else { comple ^= Cudd_IsComplement(cuddE(tmp)); tmp = Cudd_Regular(cuddE(tmp)); }
+    }
+
+    p0_mid = 0.0;
+    p1_mid = 0.0;
+
+    if (cuddIsConstant(tmp)) {
+        if (forced_val == 0) p0_mid = 1.0; else p1_mid = 1.0;
+    } else {
+        DdNode* node = Cudd_NotCond(tmp, comple);
+        Cudd_Ref(node);
+        double p = measure_probability(node, k/2, nVar, nAnci_fourInt, forced_val);
+        p *= H_factor * H_factor * normalize_factor * normalize_factor;
+        
+        if (forced_val == 0) p0_mid = p; else p1_mid = p;
+        Cudd_RecursiveDeref(manager, node);
+    }
+
+    DdNode* projection = (forced_val == 1) ? Cudd_bddIthVar(manager, qIndex) : Cudd_Not(Cudd_bddIthVar(manager, qIndex));
+    Cudd_Ref(projection);
+
+    for (int i = 0; i < w; i++) {
+        for (int j = 0; j < r; j++) {
+            DdNode* cofactored = Cudd_Cofactor(manager, All_Bdd[i][j], projection);
+            Cudd_Ref(cofactored);
+            
+            DdNode* collapsed = Cudd_bddAnd(manager, cofactored, projection); 
+            Cudd_Ref(collapsed);
+            
+            Cudd_RecursiveDeref(manager, cofactored);
+            Cudd_RecursiveDeref(manager, All_Bdd[i][j]);
+            All_Bdd[i][j] = collapsed;
+        }
+    }
+
+    if (forced_val == 0) {
+        normalize_factor *= sqrt(p0_mid);
+    } else {
+        normalize_factor *= sqrt(p1_mid);
+    }
+
+    Cudd_RecursiveDeref(manager, bigBDD);
+    bigBDD = nullptr; 
 }

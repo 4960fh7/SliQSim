@@ -38,15 +38,33 @@ void Simulator::init_simulator(int nQubits)
   SeeAlso     []
 
 ***********************************************************************/
-void Simulator::sim_qasm_file(std::string qasm)
+void Simulator::sim_qasm_pass(std::string qasm, int forced_val, int mid_measure_qubit)
 {
+    this->p0_mid = 0.0;
+    this->p1_mid = 0.0;
     std::string inStr;
     std::stringstream inFile_ss(qasm);
     while (getline(inFile_ss, inStr))
     {
         inStr = inStr.substr(0, inStr.find("//"));
+
+        if (inStr.find("if") != std::string::npos) {
+            size_t start = inStr.find("==");
+            size_t end = inStr.find(")");
+            if (start != std::string::npos && end != std::string::npos && start < end) {
+                try {
+                    int condition_val = std::stoi(inStr.substr(start + 2, end - start - 2));
+                    if (forced_val != condition_val) continue; 
+                } catch (...) { continue; } 
+                
+                inStr = inStr.substr(end + 1); 
+                inStr.erase(0, inStr.find_first_not_of(" \t")); 
+            }
+        }
+        // ------------------------------------------------
+
         if (inStr.find_first_not_of("\t\n\r ") != std::string::npos)
-        {        
+        {
             std::stringstream inStr_ss(inStr);
             getline(inStr_ss, inStr, ' ');
             if (inStr == "qreg")
@@ -72,13 +90,22 @@ void Simulator::sim_qasm_file(std::string qasm)
             else if (inStr == "measure")
             {
                 isMeasure = 1;
-                getline(inStr_ss, inStr, '[');
-                getline(inStr_ss, inStr, ']');
-                int qIndex = stoi(inStr);
-                getline(inStr_ss, inStr, '[');
-                getline(inStr_ss, inStr, ']');
-                int cIndex = stoi(inStr);
-                measure(qIndex, cIndex);
+                int qIndex = 0, cIndex = 0;
+                try {
+                    getline(inStr_ss, inStr, '[');
+                    getline(inStr_ss, inStr, ']');
+                    qIndex = std::stoi(inStr);
+                    getline(inStr_ss, inStr, '[');
+                    getline(inStr_ss, inStr, ']');
+                    cIndex = std::stoi(inStr);
+                } catch (...) { continue; }
+
+                if (qIndex == mid_measure_qubit) {
+                    // Force the mid-circuit measurement to the target pass value
+                    execute_mid_circuit_measure(qIndex, forced_val);
+                } else {
+                    measure(qIndex, cIndex); 
+                }
             }
             else
             {
@@ -252,67 +279,74 @@ void Simulator::sim_qasm_file(std::string qasm)
 ***********************************************************************/
 void Simulator::sim_qasm(std::string qasm)
 {
-    sim_qasm_file(qasm); // simulate
+    int mid_measure_qubit = -1;
+    bool is_dynamic = false;
+    std::stringstream scan_ss(qasm);
+    std::string line;
+    
+    while (getline(scan_ss, line)) {
+        line = line.substr(0, line.find("//")); 
+        if (line.find_first_not_of("\t\n\r ") == std::string::npos) continue;
 
-    if (sim_type == 0 && isMeasure == 0)
-    {
-        std::cerr << "[Error]: no measurement detected. Cannot do sampling." << std::endl;
-        assert(sim_type != 0 || isMeasure != 0);
+        if (line.find("if") != std::string::npos) {
+            is_dynamic = true;
+            break; 
+        }
+        if (line.find("measure") != std::string::npos) {
+            size_t start = line.find("[");
+            size_t end = line.find("]");
+            if (start != std::string::npos && end != std::string::npos && start < end) {
+                try {
+                    mid_measure_qubit = std::stoi(line.substr(start + 1, end - start - 1));
+                } catch (...) { }
+            }
+        }
     }
-    if (sim_type == 1)
-    {
-        
-        if (isMeasure == 1)
-        {
-            std::cerr << "[Warning]: measurement detected. The final statevector will collapse based on the measurement outcome." << std::endl;
-            if (shots != 1)
-            {
-                shots = 1;
-                std::cerr << "[Warning]: shot number is limited to 1 in all_amplitude mode." << std::endl;
-            }
-        }    
-        else 
-        {
-            if (shots != 1)
-            {
-                std::cerr << "[Warning]: no measurement detected. The --shots argument is ignored." << std::endl;
-            }
-        }  
+    
+    if (!is_dynamic || mid_measure_qubit == -1) {
+        sim_qasm_pass(qasm, 0, -1);
+        if (sim_type == 0) {
+            create_bigBDD();
+            if (this->shots > 0) measurement();
+        } else if (sim_type == 1) {
+            getStatevector();
+        }
+        print_results();
+        return;
     }
 
-    // measure based on simulator type
-    if (sim_type == 0) // sampling mode
-    {
+    int total_shots = shots;
+    std::unordered_map<std::string, int> final_counts;
+
+    // PASS 0: Force mid-circuit measurement to 0
+    state_count.clear(); 
+    sim_qasm_pass(qasm, 0, mid_measure_qubit); 
+    
+    if (sim_type == 0) {
         create_bigBDD();
-        measurement();
-        print_results();
+        this->shots = std::round(total_shots * p0_mid); 
+        if (this->shots > 0) measurement();
+        for (auto const& [key, val] : state_count) final_counts[key] += val;
     }
-    else if (sim_type == 1) // all_amplitude mode
-    {
-        if (isMeasure)
-        {
-            create_bigBDD();
-            measurement();
-        }
-        else if (isQuery)
-        {
-            create_bigBDD();
-        }
-        getStatevector();
-        print_results();
-    }
-    else if (sim_type == 2)
-    {
+    
+    double saved_p0_mid = p0_mid; 
+    clear(); 
+    state_count.clear(); 
+    
+    // PASS 1: Force mid-circuit measurement to 1
+    sim_qasm_pass(qasm, 1, mid_measure_qubit); 
+    
+    if (sim_type == 0) {
         create_bigBDD();
+        this->shots = total_shots - std::round(total_shots * saved_p0_mid); 
+        if (this->shots > 0) measurement();
+        for (auto const& [key, val] : state_count) final_counts[key] += val;
     }
-    else
-    {
-        std::cerr << "[Error]: unknown sim_type." << std::endl;
-        exit(-1);
-    }
+
+    state_count = final_counts;
+    this->shots = total_shots;
+    print_results();
 }
-
-
 
 /**Function*************************************************************
 
