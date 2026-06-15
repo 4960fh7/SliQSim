@@ -1401,42 +1401,12 @@ void Simulator::getStatevector()
 ***********************************************************************/
 void Simulator::execute_mid_circuit_measure(int qIndex, int forced_val)
 {
-    p0_mid = 0.0;
-    p1_mid = 0.0;
-
     create_bigBDD(); 
-
-    double oneroot2 = 1 / sqrt(2);
-    double H_factor = pow(oneroot2, k%2);
-    int nAnci_oneInt = ceil(log(r) / log(2)), nAnci_fourInt = ceil(log(w) / log(2)), nAnci = nAnci_oneInt + nAnci_fourInt, nVar = n + nAnci;
-
-    int index = Cudd_ReadInvPerm(manager, qIndex);
-    int comple = Cudd_IsComplement(bigBDD);
-    DdNode* tmp = Cudd_Regular(bigBDD);
-
-    while (!(tmp->index == index)) {
-        if (cuddIsConstant(tmp)) break;
-        if ((tmp->index < n)) tmp = cuddT(tmp);
-        else { comple ^= Cudd_IsComplement(cuddE(tmp)); tmp = Cudd_Regular(cuddE(tmp)); }
-    }
-
-    p0_mid = 0.0;
-    p1_mid = 0.0;
-
-    if (cuddIsConstant(tmp)) {
-        if (forced_val == 0) p0_mid = 1.0; else p1_mid = 1.0;
-    } else {
-        DdNode* node = Cudd_NotCond(tmp, comple);
-        Cudd_Ref(node);
-        double p = measure_probability(node, k/2, nVar, nAnci_fourInt, forced_val);
-        p *= H_factor * H_factor * normalize_factor * normalize_factor;
-        
-        if (forced_val == 0) p0_mid = p; else p1_mid = p;
-        Cudd_RecursiveDeref(manager, node);
-    }
 
     DdNode* projection = (forced_val == 1) ? Cudd_bddIthVar(manager, qIndex) : Cudd_Not(Cudd_bddIthVar(manager, qIndex));
     Cudd_Ref(projection);
+
+    double target_p = get_prob(projection) * normalize_factor * normalize_factor;
 
     for (int i = 0; i < w; i++) {
         for (int j = 0; j < r; j++) {
@@ -1452,12 +1422,47 @@ void Simulator::execute_mid_circuit_measure(int qIndex, int forced_val)
         }
     }
 
-    if (forced_val == 0) {
-        normalize_factor *= sqrt(p0_mid);
-    } else {
-        normalize_factor *= sqrt(p1_mid);
+    if (target_p > 1e-12) {
+        normalize_factor /= sqrt(target_p);
     }
 
+    Cudd_RecursiveDeref(manager, projection);
     Cudd_RecursiveDeref(manager, bigBDD);
     bigBDD = nullptr; 
+}
+
+/**Function*************************************************************
+  Synopsis    [Measure, probabilistically collapse, and return outcome]
+***********************************************************************/
+int Simulator::measure_and_collapse(int qIndex)
+{
+    create_bigBDD(); 
+
+    DdNode* proj_0 = Cudd_Not(Cudd_bddIthVar(manager, qIndex));
+    DdNode* proj_1 = Cudd_bddIthVar(manager, qIndex);
+    Cudd_Ref(proj_0);
+    Cudd_Ref(proj_1);
+
+    double p0 = get_prob(proj_0) * normalize_factor * normalize_factor;
+    double p1 = get_prob(proj_1) * normalize_factor * normalize_factor;
+
+    Cudd_RecursiveDeref(manager, proj_0);
+    Cudd_RecursiveDeref(manager, proj_1);
+    
+    Cudd_RecursiveDeref(manager, bigBDD);
+    bigBDD = nullptr;
+
+    std::uniform_real_distribution<double> dis(0.0, 1.0);
+    double rand_num = dis(gen);
+    
+    int outcome = 0;
+    double sum = p0 + p1;
+    
+    if (sum > 1e-12) {
+        outcome = (rand_num > (p0 / sum)) ? 1 : 0;
+    }
+
+    execute_mid_circuit_measure(qIndex, outcome);
+
+    return outcome;
 }

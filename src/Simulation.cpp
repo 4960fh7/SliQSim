@@ -47,6 +47,9 @@ void Simulator::sim_qasm_pass(std::string qasm, int forced_val, int mid_measure_
     while (getline(inFile_ss, inStr))
     {
         inStr = inStr.substr(0, inStr.find("//"));
+        
+        inStr.erase(0, inStr.find_first_not_of(" \t\r\n"));
+        if (inStr.empty()) continue;
 
         if (inStr.find("if") != std::string::npos) {
             size_t start = inStr.find("==");
@@ -279,6 +282,11 @@ void Simulator::sim_qasm_pass(std::string qasm, int forced_val, int mid_measure_
 ***********************************************************************/
 void Simulator::sim_qasm(std::string qasm)
 {
+    if (qasm.find("while") != std::string::npos || qasm.find("reset") != std::string::npos) {
+        sim_dynamic(qasm);
+        return;
+    }
+
     int mid_measure_qubit = -1;
     bool is_dynamic = false;
     std::stringstream scan_ss(qasm);
@@ -361,7 +369,6 @@ void Simulator::sim_qasm(std::string qasm)
 ***********************************************************************/
 void Simulator::print_results()
 {
-    // write output string based on state_count and statevector
     std::unordered_map<std::string, int>::iterator it;
     
     run_output = "{";
@@ -381,4 +388,299 @@ void Simulator::print_results()
     run_output += (statevector != "null") ? "\"statevector\": " + statevector + " }" : " }";
     //return;
     std::cout << run_output << std::endl;
+}
+
+/**Function*************************************************************
+  Synopsis    [Active qubit reset: Measure and apply conditional X]
+***********************************************************************/
+void Simulator::reset(int qIndex)
+{
+    int outcome = measure_and_collapse(qIndex);
+    if (outcome == 1) {
+        PauliX(qIndex);
+    }
+}
+
+/**Function*************************************************************
+  Synopsis    [Evaluate classical condition against live register]
+***********************************************************************/
+int Simulator::evaluate_condition(std::string condition_str)
+{
+    condition_str.erase(remove_if(condition_str.begin(), condition_str.end(), ::isspace), condition_str.end());
+    size_t eq_pos = condition_str.find("==");
+    if (eq_pos != std::string::npos) {
+        int target_val = std::stoi(condition_str.substr(eq_pos + 2));
+        int current_val = 0;
+        for (int i = 0; i < live_creg.size(); i++) {
+            current_val += live_creg[i] * (1 << i);
+        }
+        return (current_val == target_val) ? 1 : 0;
+    }
+    return 0;
+}
+
+/**Function*************************************************************
+  Synopsis    [Recursive QASM Block Interpreter for Loops]
+***********************************************************************/
+void Simulator::execute_qasm_block(std::string block)
+{
+    std::string inStr;
+    std::stringstream inFile_ss(block);
+    
+    while (getline(inFile_ss, inStr))
+    {
+        inStr = inStr.substr(0, inStr.find("//"));
+        inStr.erase(0, inStr.find_first_not_of(" \t\r\n"));
+        inStr.erase(inStr.find_last_not_of(" \t\r\n") + 1);
+        if (inStr.empty()) continue;
+
+        if (inStr.find("while") == 0) { 
+            size_t start_cond = inStr.find("(");
+            size_t end_cond = inStr.find(")");
+            std::string condition = inStr.substr(start_cond + 1, end_cond - start_cond - 1);
+            
+            std::string loop_body = "";
+            int bracket_count = 0;
+            if (inStr.find("{") != std::string::npos) {
+                bracket_count = 1;
+            }
+            std::string loop_line;
+            while (getline(inFile_ss, loop_line)) {
+                if (loop_line.find("{") != std::string::npos) bracket_count++;
+                if (loop_line.find("}") != std::string::npos) bracket_count--;
+                if (bracket_count == 0) break;
+                loop_body += loop_line + "\n";
+            }
+            
+            while (evaluate_condition(condition)) {
+                execute_qasm_block(loop_body);
+            }
+            continue; 
+        }
+
+        if (inStr.find("if") == 0) {
+            size_t start = inStr.find("(");
+            size_t end = inStr.find(")");
+            std::string condition = inStr.substr(start + 1, end - start - 1);
+            
+            if (!evaluate_condition(condition)) continue; 
+            
+            inStr = inStr.substr(end + 1); 
+            inStr.erase(0, inStr.find_first_not_of(" \t\r\n")); 
+        }
+
+        std::stringstream inStr_ss(inStr);
+        
+        getline(inStr_ss, inStr, ' ');
+
+        if (inStr == "OPENQASM" || inStr == "include" || inStr == "qreg" || inStr == "creg" || inStr == "}") continue;
+        if (inStr == "measure") {
+            int qIndex = 0, cIndex = 0;
+            getline(inStr_ss, inStr, '['); getline(inStr_ss, inStr, ']'); qIndex = std::stoi(inStr);
+            getline(inStr_ss, inStr, '['); getline(inStr_ss, inStr, ']'); cIndex = std::stoi(inStr);
+            
+            int outcome = measure_and_collapse(qIndex);
+            if (cIndex >= live_creg.size()) live_creg.resize(cIndex + 1, 0);
+            live_creg[cIndex] = outcome;
+        }
+        else if (inStr == "reset") {
+            getline(inStr_ss, inStr, '['); getline(inStr_ss, inStr, ']');
+            reset(std::stoi(inStr));
+        }
+        else if (inStr == "x") {
+            getline(inStr_ss, inStr, '[');
+            getline(inStr_ss, inStr, ']');
+            PauliX(stoi(inStr));
+        }
+        else if (inStr == "y")
+        {
+            getline(inStr_ss, inStr, '[');
+            getline(inStr_ss, inStr, ']');
+            PauliY(stoi(inStr));
+        }
+        else if (inStr == "z")
+        {
+            std::vector<int> iqubit(1);
+            getline(inStr_ss, inStr, '[');
+            getline(inStr_ss, inStr, ']');
+            iqubit[0] = stoi(inStr);
+            PauliZ(iqubit);
+            iqubit.clear();
+        }
+        else if (inStr == "h")
+        {
+            getline(inStr_ss, inStr, '[');
+            getline(inStr_ss, inStr, ']');
+            Hadamard(stoi(inStr));
+        }
+        else if (inStr == "s")
+        {
+            getline(inStr_ss, inStr, '[');
+            getline(inStr_ss, inStr, ']');
+            int iqubit = stoi(inStr);
+            Phase_shift(2, iqubit);
+        }
+        else if (inStr == "sdg")
+        {
+            getline(inStr_ss, inStr, '[');
+            getline(inStr_ss, inStr, ']');
+            int iqubit = stoi(inStr);
+            Phase_shift_dagger(-2, iqubit);
+        }
+        else if (inStr == "t")
+        {
+            getline(inStr_ss, inStr, '[');
+            getline(inStr_ss, inStr, ']');
+            int iqubit = stoi(inStr);
+            Phase_shift(4, iqubit);
+        }
+        else if (inStr == "tdg")
+        {
+            getline(inStr_ss, inStr, '[');
+            getline(inStr_ss, inStr, ']');
+            int iqubit = stoi(inStr);
+            Phase_shift_dagger(-4, iqubit);
+        }
+        else if (inStr == "rx(pi/2)")
+        {
+            getline(inStr_ss, inStr, '[');
+            getline(inStr_ss, inStr, ']');
+            rx_pi_2(stoi(inStr));
+        }
+        else if (inStr == "ry(pi/2)")
+        {
+            getline(inStr_ss, inStr, '[');
+            getline(inStr_ss, inStr, ']');
+            ry_pi_2(stoi(inStr));
+        }
+        else if (inStr == "cx")
+        {
+            std::vector<int> cont(1);
+            std::vector<int> ncont(0);
+            int targ;
+            getline(inStr_ss, inStr, '[');
+            getline(inStr_ss, inStr, ']');
+            cont[0] = stoi(inStr);
+            getline(inStr_ss, inStr, '[');
+            getline(inStr_ss, inStr, ']');
+            targ = stoi(inStr);
+            Toffoli(targ, cont, ncont);
+            cont.clear();
+            ncont.clear();
+        }
+        else if (inStr == "cz")
+        {
+            std::vector<int> iqubit(2);
+            for (int i = 0; i < 2; i++)
+            {
+                getline(inStr_ss, inStr, '[');
+                getline(inStr_ss, inStr, ']');
+                iqubit[i] = stoi(inStr);
+            }
+            PauliZ(iqubit);
+            iqubit.clear();
+        }
+        else if (inStr == "swap")
+        {
+            int swapA, swapB;
+            std::vector<int> cont(0);
+            for (int i = 0; i < 2; i++)
+            {
+                getline(inStr_ss, inStr, '[');
+                getline(inStr_ss, inStr, ']');
+                if (i == 0)
+                    swapA = stoi(inStr);
+                else
+                    swapB = stoi(inStr);
+            }
+            Fredkin(swapA, swapB, cont);
+            cont.clear();
+        }
+        else if (inStr == "cswap")
+        {
+            int swapA, swapB;
+            std::vector<int> cont(1);
+            for (int i = 0; i < 3; i++)
+            {
+                getline(inStr_ss, inStr, '[');
+                getline(inStr_ss, inStr, ']');
+                if (i == 0)
+                    cont[i] = stoi(inStr);
+                else if (i == 1)
+                    swapA = stoi(inStr);
+                else
+                    swapB = stoi(inStr);
+            }
+            Fredkin(swapA, swapB, cont);
+            cont.clear();
+        }
+        else if (inStr == "ccx" || inStr == "mcx")
+        {
+            std::vector<int> cont(0);
+            std::vector<int> ncont(0);
+            int targ;
+            getline(inStr_ss, inStr, '[');
+            while(getline(inStr_ss, inStr, ']'))
+            {
+                cont.push_back(stoi(inStr));
+                getline(inStr_ss, inStr, '[');
+            }
+            targ = cont.back();
+            cont.pop_back();
+            Toffoli(targ, cont, ncont);
+            cont.clear();
+            ncont.clear();
+        }
+    }
+}
+
+/**Function*************************************************************
+  Synopsis    [Monte Carlo Execution Entry Point]
+***********************************************************************/
+void Simulator::sim_dynamic(std::string qasm)
+{
+    std::unordered_map<std::string, int> final_counts;
+
+    int total_qubits = 0;
+    int total_clbits = 0;
+    std::stringstream scan_ss(qasm);
+    std::string line;
+    while(getline(scan_ss, line)) {
+        if (line.find("qreg") != std::string::npos) {
+            size_t start = line.find("[");
+            size_t end = line.find("]");
+            if(start != std::string::npos && end != std::string::npos)
+                total_qubits = std::stoi(line.substr(start + 1, end - start - 1));
+        }
+        if (line.find("creg") != std::string::npos) {
+            size_t start = line.find("[");
+            size_t end = line.find("]");
+            if(start != std::string::npos && end != std::string::npos)
+                total_clbits = std::stoi(line.substr(start + 1, end - start - 1));
+        }
+    }
+    
+    this->n = total_qubits;
+    this->nClbits = total_clbits;
+    
+    init_simulator(total_qubits); 
+
+    for (int s = 0; s < shots; s++) {
+        reset_shot(total_qubits);
+        this->nClbits = total_clbits;
+        live_creg.assign(nClbits, 0);
+        normalize_factor = 1.0;
+
+        execute_qasm_block(qasm);
+
+        std::string final_outcome = "";
+        for (int i = 0; i < nClbits; i++) {
+            final_outcome = std::to_string(live_creg[i]) + final_outcome; 
+        }
+        final_counts[final_outcome]++;
+    }
+
+    this->state_count = final_counts;
+    print_results();
+    clear();
 }

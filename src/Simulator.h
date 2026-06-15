@@ -86,6 +86,8 @@ public:
     void sim_qasm_file(std::string qasm);
     void sim_qasm(std::string qasm);
     void print_results();
+    void reset(int qIndex);
+    void sim_dynamic(std::string qasm);
 
     /* misc */
     void reorder();
@@ -128,6 +130,10 @@ private:
     const std::unordered_set<std::string> keyword_condition = {KW_BTN, KW_OOF, KW_GEQ, KW_LEQ};
     std::string condition_stack = "";
     std::vector<double> range = {0, 0};
+    std::vector<int> live_creg;
+    void execute_qasm_block(std::string block);
+    int measure_and_collapse(int qIndex);
+    int evaluate_condition(std::string condition_str);
 
     unsigned long gatecount;
     unsigned long NodeCount;
@@ -180,6 +186,27 @@ private:
         state_count.clear();
         Cudd_Quit(manager);
     };
+    void reset_shot(int total_qubits) {
+        // Safely dereference existing state vector BDD arrays
+        for (int i = 0; i < w; i++) {
+            for (int j = 0; j < r; j++) {
+                Cudd_RecursiveDeref(manager, All_Bdd[i][j]);
+            }
+            delete[] All_Bdd[i];
+        }
+        delete[] All_Bdd;
+        
+        if (bigBDD != nullptr) {
+            Cudd_RecursiveDeref(manager, bigBDD);
+            bigBDD = nullptr;
+        }
+
+        // Re-initialize a fresh state vector (all |0>)
+        int *constants = new int[total_qubits];
+        for (int i = 0; i < total_qubits; i++) constants[i] = 0;
+        init_state(constants);
+        delete[] constants;
+    }
 };
 
 #endif
